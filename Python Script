@@ -1,0 +1,995 @@
+!pip install os
+!pip install math
+!pip install numpy
+!pip install gdal
+!apt-get install gdal-bin python3-gdal -y
+!apt-get install gdal-bin python3-gdal -y
+from osgeo import gdal
+import matplotlib.pyplot as plt
+import numpy as np
+from copy import deepcopy
+import matplotlib.pyplot as plt
+from scipy.ndimage import distance_transform_edt
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import NearestNeighbors
+import random
+from scipy.stats import entropy as scipy_entropy
+from sklearn.neighbors import NearestNeighbors
+import os, math
+import numpy as np
+from copy import deepcopy
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, Flatten, Dense, Input
+from sklearn.model_selection import train_test_split
+
+import seaborn as sns
+from sklearn.metrics import r2_score, mean_squared_error
+
+def readraster(file):
+    """Read a single-band raster and return its GDAL dataset and numpy array."""
+    dataSource = gdal.Open(file)
+    if dataSource is None:
+        raise IOError(f"Cannot open file: {file}")
+    band = dataSource.GetRasterBand(1)
+    array = band.ReadAsArray()
+    return dataSource, array
+
+def identicalList(inList):
+    return np.all(np.array(inList) == inList[0])
+
+def builtupAreaDifference(landcover1, landcover2, buclass=1, cellsize=30):
+    diff = ((landcover2 == buclass).astype(int) - (landcover1 == buclass).astype(int)) != 0
+    return np.sum(diff) * (cellsize**2) / 1e6
+
+def readStudyAreaMask(file):
+    """Reads a study area mask raster file (assumes 1 inside study area, 0 outside)."""
+    ds, arr = readraster(file)
+    # Convert to boolean mask (True=inside study area)
+    mask = arr == 1
+    return mask
+
+class landcover:
+    def __init__(self, file1, file2):
+        self.ds_lc1, self.arr_lc1 = readraster(file1)
+        self.ds_lc2, self.arr_lc2 = readraster(file2)
+        self.performChecks()
+
+    def performChecks(self):
+        print("Checking landcover raster dimensions...")
+        if (self.ds_lc1.RasterXSize == self.ds_lc2.RasterXSize and
+            self.ds_lc1.RasterYSize == self.ds_lc2.RasterYSize):
+            self.row, self.col = self.ds_lc1.RasterYSize, self.ds_lc1.RasterXSize
+            print(f"Dimensions matched: {self.row} rows x {self.col} columns")
+        else:
+            raise ValueError("Input landcover rasters have different dimensions")
+
+        print("Checking class consistency...")
+        if np.array_equal(np.unique(self.arr_lc1), np.unique(self.arr_lc2)):
+            self.classes = np.unique(self.arr_lc1)
+            print(f"Class values matched: {self.classes}")
+        else:
+            print("Warning: Class values differ between input rasters")
+
+class growthFactors:
+    def __init__(self, *args):
+        self.gf = {}
+        self.gf_ds = {}
+        self.nFactors = len(args)
+
+        for idx, file in enumerate(args, 1):
+            self.gf_ds[idx], self.gf[idx] = readraster(file)
+
+        self.performChecks()
+
+    def performChecks(self):
+        rows = [ds.RasterYSize for ds in self.gf_ds.values()]
+        cols = [ds.RasterXSize for ds in self.gf_ds.values()]
+
+        if identicalList(rows) and identicalList(cols):
+            self.row, self.col = rows[0], cols[0]
+            print(f"Growth factors size matched: {self.row} x {self.col}")
+        else:
+            raise ValueError("Growth factors have inconsistent dimensions")
+
+
+class distance_density:
+    def __init__(self, *args):
+        self.dd_array = dict()  # Dictionary to store raster arrays
+        self.dd_ds = dict()     # Dictionary to store raster datasets (optional)
+        self.dd_nFactors = len(args)  # Number of input raster layers
+        n = 1
+        for file in args:
+            self.dd_ds[n], self.dd_array[n] = readraster(file)  # Assume readraster(file) returns (dataset, array)
+            n += 1
+
+    def extractLayerValues(self, landcover_dd):
+        self.landcover_dd = landcover_dd
+        combined_values = []
+
+        # Loop through each cell in the land cover layers
+        for y in range(0, self.landcover_dd.row):
+            for x in range(0, self.landcover_dd.col):
+                # Check if the cell corresponds to a built-up cell (value = 0)
+                if self.landcover_dd.arr_lc2[y, x] == 1:
+                    cell_values = []
+                    for n in range(1, self.dd_nFactors + 1):
+                        cell_values.append(self.dd_array[n][y, x])  # Append value from the nth raster layer
+
+                    # Add the combined values for the current cell to the list
+                    combined_values.append(cell_values)
+
+        # Convert the list into a numpy array
+        combined_values_array = np.array(combined_values)
+        self.features = combined_values_array[:, :3]
+        self.kernel_values = combined_values_array[:, 3:]
+
+class EntropyRuleGenerator:
+    def __init__(self, landcover_class, growthfactors_class, urban_class=1):
+        self.lc = landcover_class
+        self.gf = growthfactors_class
+        self.urban_class = urban_class
+        self.criteria_priority = None
+        self.rule_set = None
+        self.sub_rule_sets = []
+        self.bins = {}  # Precomputed bins storage
+        self._prepare_training_data()
+
+    def _prepare_training_data(self):
+        """Identify transition cells and precompute bins."""
+        transition_mask = (self.lc.arr_lc1 != self.urban_class) & (self.lc.arr_lc2 == self.urban_class)
+        self.transition_cells = {
+            factor: self.gf.gf[factor][transition_mask]
+            for factor in self.gf.gf
+        }
+        self.non_transition_cells = {
+            factor: self.gf.gf[factor][~transition_mask]
+            for factor in self.gf.gf
+        }
+
+        # Precompute bins for each factor using combined data
+        for factor in self.gf.gf:
+            combined = np.concatenate([
+                self.transition_cells[factor],
+                self.non_transition_cells[factor]
+            ])
+            self.bins[factor] = np.percentile(combined, [0, 25, 50, 75, 100])
+
+    def calculate_entropy_priority(self):
+        """Calculate Shannon entropy for criteria using vectorized operations."""
+        entropy_values = {}
+
+        for factor in self.gf.gf:
+            # Get all values and their bins
+            values = np.concatenate([
+                self.transition_cells[factor],
+                self.non_transition_cells[factor]
+            ])
+            bins = self.bins[factor]
+            digitized = np.digitize(values, bins)
+
+            # Split into transition and non-transition
+            n_trans = len(self.transition_cells[factor])
+            trans_counts = np.bincount(digitized[:n_trans], minlength=len(bins)+1)
+            non_trans_counts = np.bincount(digitized[n_trans:], minlength=len(bins)+1)
+
+            # Calculate probabilities
+            total_counts = trans_counts + non_trans_counts
+            p_trans = trans_counts / (total_counts + 1e-9)
+
+            # Vectorized entropy calculation
+            entropy_arr = -p_trans * np.log2(p_trans + 1e-9) - (1 - p_trans) * np.log2(1 - p_trans + 1e-9)
+            weight = total_counts / total_counts.sum()
+            entropy_values[factor] = np.nansum(entropy_arr * weight)
+
+        self.criteria_priority = sorted(entropy_values.items(), key=lambda x: x[1])
+        print("Criteria priority (ascending entropy):")
+        for factor, ent in self.criteria_priority:
+            print(f"Factor {factor}: H={ent:.4f}")
+
+    def generate_rule_set(self, null_handling_depth=2):
+        """Generate rule sets with vectorized operations."""
+        self.rule_set = self._create_rule_set(self.criteria_priority)
+        self.sub_rule_sets = []
+
+        for i in range(1, null_handling_depth+1):
+            subset = self.criteria_priority[:-i]
+            if len(subset) < 1:
+                break
+            self.sub_rule_sets.append(self._create_rule_set(subset))
+
+    def _create_rule_set(self, criteria_subset):
+        """Vectorized rule generation using numpy.unique."""
+        factor_order = [factor for factor, _ in criteria_subset]
+        n_factors = len(factor_order)
+
+        # Process transition cells
+        trans_rules = np.zeros((len(self.transition_cells[1]), n_factors), dtype=int)
+        for i, factor in enumerate(factor_order):
+            trans_rules[:, i] = np.digitize(self.transition_cells[factor], self.bins[factor])
+
+        # Process non-transition cells
+        nontrans_rules = np.zeros((len(self.non_transition_cells[1]), n_factors), dtype=int)
+        for i, factor in enumerate(factor_order):
+            nontrans_rules[:, i] = np.digitize(self.non_transition_cells[factor], self.bins[factor])
+
+        # Combine all rules with labels
+        all_rules = np.vstack([trans_rules, nontrans_rules])
+        labels = np.concatenate([
+            np.ones(trans_rules.shape[0]),
+            np.zeros(nontrans_rules.shape[0])
+        ])
+
+        # Find unique rules using vectorized operations
+        unique_rules, inverse, counts = np.unique(
+            all_rules, axis=0, return_inverse=True, return_counts=True
+        )
+
+        # Calculate probabilities and entropy
+        rule_set = {}
+        for idx in range(len(unique_rules)):
+            mask = inverse == idx
+            prob = np.mean(labels[mask])
+            entropy_val = scipy_entropy([prob, 1 - prob], base=2) if prob not in [0, 1] else 0
+            rule = tuple(zip(factor_order, unique_rules[idx]))
+            rule_set[rule] = {
+                'probability': prob,
+                'entropy': entropy_val,
+                'count': counts[idx]
+            }
+
+        return rule_set
+
+class fitmodel:
+    def __init__(self, landcoverClass, growthfactorsClass, study_area_mask=None):
+        self.landcovers = landcoverClass
+        self.factors = growthfactorsClass
+        self.study_area_mask = study_area_mask  # Boolean array (True = inside study area)
+        self.performChecks()
+        self.newly_urbanized_cells = None
+        self.entropy_rules = None
+        self.sub_rule_sets = []
+        self.min_rule_entropy = 0.9
+        self.use_entropy_rules = False
+        self.weights = None
+        self.factor_thresholds = {}
+        self.restriction_layer = None
+        self.distance_kernel = None
+
+    def performChecks(self):
+        if (self.landcovers.row == self.factors.row and
+            self.landcovers.col == self.factors.col):
+            self.row, self.col = self.factors.row, self.factors.col
+            print("Landcover and growth factors dimensions matched")
+        else:
+            raise ValueError("Dimension mismatch between landcover and factors")
+        # If a study area mask is provided, check its dimensions.
+        if self.study_area_mask is not None:
+            if self.study_area_mask.shape != (self.row, self.col):
+                raise ValueError("Study area mask dimensions do not match the rasters.")
+
+    def setTransitionParameters(self, weights=None, factor_thresholds=None,
+                                development_pressure=100, dispersion=0.8,
+                                decay_rate=0.5, kernel_size=5,
+                                conversion_threshold=0.9, restriction_layer=None,
+                                min_urban_neighbors=5, neighborhood_weight=8):
+        if factor_thresholds is None:
+            factor_thresholds = {}
+
+        self.weights = weights
+        self.factor_thresholds = factor_thresholds
+        self.development_pressure = development_pressure
+        self.dispersion = dispersion
+        self.decay_rate = decay_rate
+        self.kernel_size = kernel_size
+        self.conversion_threshold = conversion_threshold
+        self.restriction_layer = restriction_layer
+        self.min_urban_neighbors = min_urban_neighbors
+        self.neighborhood_weight = neighborhood_weight
+
+        if self.restriction_layer is not None:
+            if self.restriction_layer not in self.factors.gf:
+                raise ValueError(f"Restriction layer {restriction_layer} not found in growth factors")
+
+        for factor in self.factor_thresholds:
+            if factor not in self.factors.gf:
+                raise ValueError(f"Factor {factor} in thresholds not found in growth factors")
+            op, val = self.factor_thresholds[factor]
+            if op not in ['<', '>', '<=', '>=', '==']:
+                raise ValueError(f"Invalid operator {op} for factor {factor}")
+
+        center = kernel_size // 2
+        self.distance_kernel = np.zeros((kernel_size, kernel_size))
+        for i in range(kernel_size):
+            for j in range(kernel_size):
+                distance = np.sqrt((i-center)**2 + (j-center)**2)
+                self.distance_kernel[i, j] = np.exp(-self.decay_rate * distance)
+        self.distance_kernel /= self.distance_kernel.sum()
+
+    def setEntropyRules(self, entropy_rule_generator, min_rule_entropy=0.5):
+        self.entropy_rules = entropy_rule_generator
+        self.sub_rule_sets = entropy_rule_generator.sub_rule_sets
+        self.min_rule_entropy = min_rule_entropy
+        self.use_entropy_rules = True
+
+    def _get_transition_probability(self, y, x):
+        rule = []
+        for factor, _ in self.entropy_rules.criteria_priority:
+            value = self.factors.gf[factor][y, x]
+            disc_value = np.digitize(value, self.entropy_rules.bins[factor])
+            rule.append((factor, disc_value))
+
+        rule_tuple = tuple(rule)
+
+        if rule_tuple in self.entropy_rules.rule_set:
+            rule_info = self.entropy_rules.rule_set[rule_tuple]
+            if rule_info['entropy'] <= self.min_rule_entropy:
+                return rule_info['probability']
+
+        for sub_rule_set in self.sub_rule_sets:
+            sub_rule = tuple(r for r in rule_tuple if r[0] in [f[0] for f in sub_rule_set])
+            if sub_rule in sub_rule_set:
+                rule_info = sub_rule_set[sub_rule]
+                if rule_info['entropy'] <= self.min_rule_entropy:
+                    return rule_info['probability']
+
+        return 0.0
+
+    def predict(self, n_iterations=1):
+        # Start from the latest landcover data (lc2)
+        self.predicted = deepcopy(self.landcovers.arr_lc2)
+        urban_class = 1
+        margin = self.kernel_size // 2
+
+        for iteration in range(n_iterations):
+            self.newly_urbanized_cells = np.zeros_like(self.predicted)
+            print(f"\nIteration {iteration+1}/{n_iterations}")
+
+            # Get indices for non-urban cells. If a study area mask is provided, restrict to it.
+            non_urban_mask = (self.predicted != urban_class)
+            if self.study_area_mask is not None:
+                non_urban_mask = non_urban_mask & self.study_area_mask
+            y_coords, x_coords = np.where(non_urban_mask)
+
+            for idx in range(len(y_coords)):
+                y, x = y_coords[idx], x_coords[idx]
+                # Ensure we have enough margin for the kernel window
+                if not (margin <= y < self.row - margin and margin <= x < self.col - margin):
+                    continue
+
+                # Skip restricted areas if a restriction layer is used
+                if self.restriction_layer is not None:
+                    if self.factors.gf[self.restriction_layer][y, x] > 0:
+                        continue
+
+                # Calculate transition probability using entropy rules
+                prob = self._get_transition_probability(y, x)
+
+                # Consider neighborhood influence from the current state
+                neighborhood = self.predicted[y-margin:y+margin+1, x-margin:x+margin+1]
+                urban_count = np.sum(neighborhood == urban_class)
+                prob *= 1 + (urban_count / neighborhood.size) * self.neighborhood_weight
+
+                # Add random dispersion
+                prob += np.random.random() * self.dispersion
+
+                # Apply development pressure
+                prob *= self.development_pressure
+
+                # If probability exceeds conversion threshold, mark as urban
+                if prob > self.conversion_threshold:
+                    self.predicted[y, x] = urban_class
+                    self.newly_urbanized_cells[y, x] = 1
+
+                if idx % 1000 == 0 and idx > 0:
+                    current_growth = np.sum(self.newly_urbanized_cells) * (30**2) / 1e6
+                    print(f"Processed {idx}/{len(y_coords)} | Predicted growth: {current_growth:.2f} km²", end='\r')
+
+            # Update development pressure based on new growth (optional adjustment)
+            self.development_pressure *= 0.95  # Reduce pressure over iterations
+
+
+
+    def checkAccuracy(self, reference_array):
+            """Evaluate prediction accuracy with comprehensive metrics and diagnostics."""
+            urban_class = 1  # Assuming urban class is 1
+
+            # Mask of cells that were non-urban in initial state and within study area
+            non_urban_initial = (self.landcovers.arr_lc2 != urban_class)
+            if self.study_area_mask is not None:
+                non_urban_initial &= self.study_area_mask
+
+            # Get change pixels within valid area
+            ref_changed = (reference_array[non_urban_initial] == urban_class)
+            pred_changed = (self.predicted[non_urban_initial] == urban_class)
+
+            # Confusion matrix components
+            TP = np.sum(ref_changed & pred_changed)
+            FP = np.sum(~ref_changed & pred_changed)
+            FN = np.sum(ref_changed & ~pred_changed)
+            TN = np.sum(~ref_changed & ~pred_changed)
+            total_cells = non_urban_initial.sum()
+
+            # Check for valid total cells
+            if total_cells == 0:
+                print("Error: No non-urban cells available for validation.")
+                return
+
+            # Area conversion parameters
+            cell_area = (30**2)/1e6  # km² per cell
+            actual_change = TP + FN
+            predicted_change = TP + FP
+
+            # Calculate disagreement metrics
+            quantity_disagreement = abs(actual_change - predicted_change) * cell_area
+            allocation_disagreement = 2 * min(actual_change, predicted_change) * cell_area - 2 * TP * cell_area
+            total_disagreement = quantity_disagreement + allocation_disagreement
+
+            # Kappa calculation with improved numerical stability
+            Po = (TP + TN) / total_cells
+            Pe = ((TP + FP) * (TP + FN) + (FN + TN) * (FP + TN)) / (total_cells ** 2)
+
+            if Pe >= 1.0 or Po >= 1.0:
+                kappa = 0.0
+            else:
+                kappa = (Po - Pe) / (1 - Pe) if (1 - Pe) != 0 else 0.0
+
+            # Calculate additional accuracy metrics
+            overall_accuracy = (TP + TN) / total_cells * 100
+            producers_accuracy = TP / (TP + FN) * 100 if (TP + FN) > 0 else 0.0
+            users_accuracy = TP / (TP + FP) * 100 if (TP + FP) > 0 else 0.0
+            f1_score = 2 * (producers_accuracy * users_accuracy) / (producers_accuracy + users_accuracy) \
+                if (producers_accuracy + users_accuracy) > 0 else 0.0
+
+            print("\n=== Advanced Accuracy Diagnostics ===")
+            print(f"Total Valid Cells: {total_cells} ({total_cells*cell_area:.2f} km²)")
+            print(f"Actual Urbanization: {actual_change} cells ({actual_change*cell_area:.2f} km²)")
+            print(f"Predicted Urbanization: {predicted_change} cells ({predicted_change*cell_area:.2f} km²)")
+            print(f"\n—— Disagreement Analysis ——")
+            print(f"Quantity Disagreement: {quantity_disagreement:.2f} km²")
+            print(f"Allocation Disagreement: {allocation_disagreement:.2f} km²")
+            print(f"Total Disagreement: {total_disagreement:.2f} km²")
+
+            print("\n—— Classification Metrics ——")
+            print(f"Overall Accuracy: {overall_accuracy:.2f}%")
+            print(f"Producer's Accuracy (Recall): {producers_accuracy:.2f}%")
+            print(f"User's Accuracy (Precision): {users_accuracy:.2f}%")
+            print(f"F1-Score: {f1_score:.2f}%")
+            print(f"Kappa Coefficient: {kappa:.4f}")
+
+            print("\n—— Confusion Matrix (Cells) ——")
+            print(f"True Positives (TP): {TP:6d} | False Positives (FP): {FP:6d}")
+            print(f"False Negatives (FN): {FN:6d} | True Negatives (TN): {TN:6d}")
+
+            # Diagnostic warnings
+            if actual_change == 0:
+                print("\nWarning: No actual urbanization in reference period!")
+            if predicted_change == 0:
+                print("\nWarning: Model predicted zero urbanization!")
+            if TP == 0 and (actual_change > 0 or predicted_change > 0):
+                print("\nCritical: Complete prediction failure - no correct urbanization predicted!")
+            elif kappa <= 0.2:
+                print("\nWarning: Very low agreement (kappa ≤ 0.2) - model needs calibration!")
+            elif 0.2 < kappa <= 0.4:
+                print("\nNote: Moderate agreement (0.2 < kappa ≤ 0.4)")
+            elif 0.4 < kappa <= 0.6:
+                print("\nNote: Good agreement (0.4 < kappa ≤ 0.6)")
+            elif kappa > 0.6:
+                print("\nSuccess: Strong agreement (kappa > 0.6)")
+
+            return {
+                'kappa': kappa,
+                'overall_accuracy': overall_accuracy,
+                'producers_accuracy': producers_accuracy,
+                'users_accuracy': users_accuracy,
+                'f1_score': f1_score,
+                'quantity_disagreement': quantity_disagreement,
+                'allocation_disagreement': allocation_disagreement
+            }
+
+
+    def exportPredicted(self, outFileName):
+        driver = gdal.GetDriverByName("GTiff")
+        outdata = driver.Create(outFileName, self.col, self.row, 1, gdal.GDT_Byte)
+        outdata.SetGeoTransform(self.landcovers.ds_lc1.GetGeoTransform())
+        outdata.SetProjection(self.landcovers.ds_lc1.GetProjection())
+        outdata.GetRasterBand(1).WriteArray(self.predicted)
+        outdata.GetRasterBand(1).SetNoDataValue(0)
+        outdata.FlushCache()
+        print(f"Prediction exported to {outFileName}")
+
+    def exportNewUrbanCells(self, outFileName):
+        driver = gdal.GetDriverByName("GTiff")
+        outdata = driver.Create(outFileName, self.col, self.row, 1, gdal.GDT_Byte)
+        outdata.SetGeoTransform(self.landcovers.ds_lc1.GetGeoTransform())
+        outdata.SetProjection(self.landcovers.ds_lc1.GetProjection())
+        outdata.GetRasterBand(1).WriteArray(self.newly_urbanized_cells)
+        outdata.GetRasterBand(1).SetNoDataValue(0)
+        outdata.FlushCache()
+        print(f"New urban cells exported to {outFileName}")
+
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler
+
+class new_cell_without_densities:
+    def __init__(self, *args):
+        self.new_cell_array = dict()
+        self.new_cell_ds = dict()
+        self.new_cell_nFactors = len(args)
+        n = 1
+        for file1 in args:
+            self.new_cell_ds[n], self.new_cell_array[n] = readraster(file1)
+            n += 1
+        self.model = None
+        self.scaler = None
+        self.kernel_components = {}
+
+    def _build_model(self, input_shape):
+        """Neural network architecture with 3 output units"""
+        model = tf.keras.Sequential([
+            tf.keras.layers.Dense(64, activation='relu', input_shape=(input_shape,)),
+            tf.keras.layers.Dense(64, activation='relu'),
+            tf.keras.layers.Dense(3)  # Output layer for 3 kernel components
+        ])
+        model.compile(optimizer='adam', loss='mse')
+        return model
+
+    def _prepare_training_data(self, features, kernel_values):
+        """Normalize input features and prepare training data"""
+        self.scaler = StandardScaler()
+        X = self.scaler.fit_transform(features)
+        y = kernel_values
+        return X, y
+
+    def _train_model(self, X, y):
+        """Train the model with prepared data"""
+        self.model = self._build_model(X.shape[1])  # Only input shape needed
+        self.model.fit(X, y, epochs=10, batch_size=32, validation_split=0.2, verbose=0)
+
+    def extract_new_layer_values(self, distancedd, landcover_new, ca_model):
+        """Main processing method with batch prediction"""
+        self.distancedd = distancedd
+        self.landcover_new = landcover_new
+        self.ca_model = ca_model
+
+        # Train model if not already trained
+        if self.model is None:
+            print("Training model on kernel components...")
+            X, y = self._prepare_training_data(
+                self.distancedd.features,
+                self.distancedd.kernel_values
+            )
+            self._train_model(X, y)
+
+        # Process new urbanized cells
+        new_cells_mask = self.ca_model.newly_urbanized_cells == 1
+        if np.any(new_cells_mask):
+            y_coords, x_coords = np.where(new_cells_mask)
+
+            # Batch extract features
+            batch_features = np.array([
+                [self.new_cell_array[n][y, x]
+                 for n in range(1, self.new_cell_nFactors+1)]
+                for y, x in zip(y_coords, x_coords)
+            ])
+
+            # Predict and store components
+            scaled_features = self.scaler.transform(batch_features)
+            batch_predictions = self.model.predict(scaled_features, verbose=0)
+
+            # Initialize component arrays
+            self.kernel_components = {
+                'shopping': np.zeros_like(new_cells_mask, dtype=float),
+                'industrial': np.zeros_like(new_cells_mask, dtype=float),
+                'residential': np.zeros_like(new_cells_mask, dtype=float)
+            }
+
+            # Assign predictions to individual components
+            self.kernel_components['shopping'][y_coords, x_coords] = batch_predictions[:, 0]
+            self.kernel_components['industrial'][y_coords, x_coords] = batch_predictions[:, 1]
+            self.kernel_components['residential'][y_coords, x_coords] = batch_predictions[:, 2]
+
+
+    def get_kernel_files(self):
+        """Return paths to temporary kernel files"""
+        temp_files = []
+        driver = gdal.GetDriverByName("MEM")  # Use in-memory driver
+        for name, array in self.kernel_components.items():
+            # Create in-memory dataset
+            ds = driver.Create(f"temp_{name}",
+                             self.landcover_new.col,
+                             self.landcover_new.row,
+                             1, gdal.GDT_Float32)
+            ds.SetGeoTransform(self.landcover_new.ds_lc1.GetGeoTransform())
+            ds.SetProjection(self.landcover_new.ds_lc1.GetProjection())
+            band = ds.GetRasterBand(1)
+            band.WriteArray(array)
+            band.SetNoDataValue(0)
+            temp_files.append(ds)  # Store dataset objects
+        return temp_files
+
+
+    def export_kernel_components(self, base_filename):
+        """Export individual kernel components as GeoTIFFs"""
+        driver = gdal.GetDriverByName("GTiff")
+
+        for kernel_name, array in self.kernel_components.items():
+            filename = f"{base_filename}_{kernel_name}.tif"
+            out_ds = driver.Create(filename,
+                                 self.landcover_new.col,
+                                 self.landcover_new.row,
+                                 1, gdal.GDT_Float32)
+            out_ds.SetGeoTransform(self.landcover_new.ds_lc1.GetGeoTransform())
+            out_ds.SetProjection(self.landcover_new.ds_lc1.GetProjection())
+            out_band = out_ds.GetRasterBand(1)
+            out_band.WriteArray(array)
+            out_band.SetNoDataValue(0)
+            out_ds.FlushCache()
+            print(f"Exported {kernel_name} density to {filename}")
+
+
+
+class building_volume_old:
+    def __init__(self, *args):
+        self.building_v_o_arr = dict()
+        self.building_v_o_ds = dict()
+        self.building_v_o_nFactors = len(args)
+        n = 1
+        for file in args:
+            self.building_v_o_ds[n], self.building_v_o_arr[n] = readraster(file)
+            n += 1
+        self.scaler = StandardScaler()
+        self.model = None
+
+    def prepare_training_data(self, landcover):
+        """Extract features and labels for training"""
+        features = []
+        labels = []
+
+        # Get built-up cells from landcover
+        builtup_mask = landcover.arr_lc2 == 1
+
+        for y in range(landcover.row):
+            for x in range(landcover.col):
+                if builtup_mask[y, x]:
+                    # Extract all features except last one (building volume)
+                    features.append([self.building_v_o_arr[n][y, x]
+                                   for n in range(1, self.building_v_o_nFactors)])
+                    # Last array is building volume (label)
+                    labels.append(self.building_v_o_arr[self.building_v_o_nFactors][y, x])
+
+        self.X = self.scaler.fit_transform(np.array(features))
+        self.y = np.array(labels)
+
+    def build_model(self):
+        """Deep learning model for building volume prediction"""
+        self.model = tf.keras.Sequential([
+            tf.keras.layers.Dense(128, activation='relu', input_shape=(self.X.shape[1],)),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(64, activation='relu'),
+            tf.keras.layers.Dense(1)  # Single output for building volume
+        ])
+        self.model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+
+    def train_model(self, epochs=100, batch_size=32):
+        """Train the volume prediction model"""
+        self.model.fit(self.X, self.y, epochs=epochs, batch_size=batch_size,
+                      validation_split=0.2, verbose=1)
+
+class building_volume_new:
+    def __init__(self, *args):
+        self.building_v_n_array = dict()
+        self.building_v_n_ds = dict()
+        self.building_v_n_nFactors = len(args)
+        n = 1
+        for item in args:
+            if isinstance(item, gdal.Dataset):
+                self.building_v_n_ds[n] = item
+                self.building_v_n_array[n] = item.ReadAsArray()
+            else:
+                self.building_v_n_ds[n], self.building_v_n_array[n] = readraster(item)
+            n += 1
+        self.height_map = None
+
+
+    def compare_with_actual(self, actual_raster_path, output_plot="volume_comparison.png"):
+            """Compare predictions with actual building volumes and generate scatter plot"""
+            # Load actual volume data
+            ds_actual, arr_actual = readraster(actual_raster_path)
+            arr_actual = arr_actual.astype(float)
+
+            # Create mask of valid comparison cells
+            valid_mask = (self.new_building_volumes > 0) & (arr_actual > 0) & ~np.isnan(arr_actual)
+
+            # Extract values for comparison
+            predicted = self.new_building_volumes[valid_mask]
+            actual = arr_actual[valid_mask]
+
+            # Calculate metrics
+            rmse = np.sqrt(np.mean((predicted - actual)**2))
+            r2 = np.corrcoef(predicted, actual)[0,1]**2
+            mae = np.mean(np.abs(predicted - actual))
+
+            # Create plot
+            plt.figure(figsize=(10, 8))
+            #plt.style.use('seaborn-darkgrid')
+
+            # Scatter plot with regression line
+            sns.regplot(x=actual, y=predicted,
+                      scatter_kws={'alpha':0.4, 'color':'#2ecc71'},
+                      line_kws={'color':'#e74c3c', 'lw':2})
+
+            # Formatting
+            plt.title("Building Volume Prediction vs Actual", fontsize=16, pad=20)
+            plt.xlabel("Actual Building Volume ($10^3$ m$^3$)", fontsize=12)
+            plt.ylabel("Predicted Building Volume ($10^3$ m$^3$)", fontsize=12)
+
+            # Add metrics text
+            textstr = '\n'.join((
+                f'RMSE = {rmse:.2f} $10^3$ m$^3$',
+                f'R² = {r2:.2f}',
+                f'MAE = {mae:.2f} $10^3$ m$^3$',
+                f'N = {len(predicted):,} cells'
+            ))
+            plt.gca().text(0.05, 0.95, textstr, transform=plt.gca().transAxes,
+                          fontsize=12, verticalalignment='top',
+                          bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+            # Set equal axes and grid
+            max_val = max(actual.max(), predicted.max()) * 1.1
+            plt.xlim(0, max_val)
+            plt.ylim(0, max_val)
+            plt.plot([0, max_val], [0, max_val], '--', color='#3498db', alpha=0.7)
+
+            plt.tight_layout()
+            plt.savefig(output_plot, dpi=300)
+            print(f"Comparison plot saved to {output_plot}")
+
+            return {
+                'rmse': rmse,
+                'r2': r2,
+                'mae': mae,
+                'samples': len(predicted)
+            }
+
+
+
+
+
+    def predict_volumes(self, old_model, landcover, ca_model):
+        """Predict building volumes using trained model"""
+        self.new_building_volumes = np.zeros_like(ca_model.newly_urbanized_cells, dtype=float)
+        new_cells = np.argwhere(ca_model.newly_urbanized_cells == 1)
+
+        # Prepare features for new cells (FIXED FEATURE COUNT)
+        features = []
+        for y, x in new_cells:
+            # Include ALL features (1 to building_v_n_nFactors)
+            features.append([self.building_v_n_array[n][y, x]
+                           for n in range(1, self.building_v_n_nFactors + 1)])  # +1 added here
+
+        if len(features) > 0:
+            scaled_features = old_model.scaler.transform(np.array(features))
+            predictions = old_model.model.predict(scaled_features, verbose=0)
+
+            # Assign predictions to new cells
+            for idx, (y, x) in enumerate(new_cells):
+                self.new_building_volumes[y, x] = predictions[idx][0]
+
+
+    def calculate_heights(self, cell_size=30, floor_height=3):
+        """
+        Convert volume to height using realistic assumptions:
+        - cell_size: Grid cell size in meters
+        - floor_height: Average height per floor in meters
+        """
+        self.height_map = np.zeros_like(self.new_building_volumes, dtype=float)
+
+        # Calculate footprint area (assume building covers entire cell)
+        footprint_area = cell_size ** 2  # m²
+
+        # Convert volume (m³) to height (m)
+        new_cells = self.new_building_volumes > 0
+        self.height_map[new_cells] = self.new_building_volumes[new_cells] / footprint_area
+
+        # Convert to floors (optional)
+        # self.height_map[new_cells] = self.height_map[new_cells] // floor_height
+
+    def export_building_volume(self, filename):
+        """Export building volume map as GeoTIFF"""
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(filename,
+                         self.height_map.shape[1],
+                         self.height_map.shape[0],
+                         1, gdal.GDT_Float32)
+        ds.SetGeoTransform(self.building_v_n_ds[1].GetGeoTransform())
+        ds.SetProjection(self.building_v_n_ds[1].GetProjection())
+        band = ds.GetRasterBand(1)
+        band.WriteArray(self.new_building_volumes)
+        band.SetNoDataValue(0)
+        ds.FlushCache()
+
+
+
+    def export_height_map(self, filename):
+        """Export building height map as GeoTIFF"""
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(filename,
+                         self.height_map.shape[1],
+                         self.height_map.shape[0],
+                         1, gdal.GDT_Float32)
+        ds.SetGeoTransform(self.building_v_n_ds[1].GetGeoTransform())
+        ds.SetProjection(self.building_v_n_ds[1].GetProjection())
+        band = ds.GetRasterBand(1)
+        band.WriteArray(self.height_map)
+        band.SetNoDataValue(0)
+        ds.FlushCache()
+
+
+# Assign the directory where files are located
+os.chdir("/content/nedata")
+
+# Input land cover GeoTIFF for two time period
+file1 = "/content/nedata/2015_cleaned.tif"
+file2 = "/content/nedata/2020_cleaned.tif"
+
+# Input all the parameters
+cbd = "/content/nedata/CBD_cleaned (1).tif"
+ntl = "/content/nedata/ntl_cleaned.tif"
+road = "/content/nedata/road_cleaned.tif"
+restricted = "/content/nedata/restricted_cleaned.tif"
+pop01 = "/content/nedata/pop_cleaned.tif"
+slope = "/content/nedata/slope_cleaned.tif"
+amenities = "/content/nedata/amenitykernel_cleaned.tif"
+commercial = "/content/nedata/commercialkernel_cleaned.tif"
+industrail = "/content/nedata/industrailkernel_cleaned.tif"
+building_volume = "/content/nedata/building volume_cleaned.tif"
+
+
+study_area_file = "/content/nedata/2025_cleaned.tif"  # Change filename as needed
+study_area_mask = readStudyAreaMask(study_area_file)
+
+# Create landcover and growth factors objects
+lc = landcover(file1, file2)
+gf = growthFactors(cbd, road, pop01, slope, restricted)
+
+mydistance_density = distance_density(cbd, road, slope, amenities, commercial, industrail)
+mydistance_density.extractLayerValues(lc)
+
+# Initialize the model with the study area mask
+model = fitmodel(lc, gf, study_area_mask=study_area_mask)
+
+# Generate entropy rules
+rule_generator = EntropyRuleGenerator(lc, gf)
+rule_generator.calculate_entropy_priority()
+rule_generator.generate_rule_set(null_handling_depth=2)
+
+# Configure and run the model using entropy rules.
+# Note: Conversion threshold is adjusted (e.g., 0.5 -> 0.45) to allow more growth. Tweak as needed.
+model.setEntropyRules(rule_generator, min_rule_entropy=0.2)
+model.setTransitionParameters()  # Lower threshold for more growth
+
+# Execute prediction (you can set n_iterations > 1 for multiple simulation steps)
+model.predict(n_iterations=1)
+
+dataSource_accuracy = gdal.Open("/content/nedata/2025_cleaned.tif")
+band_accuracy = dataSource_accuracy.GetRasterBand(1)
+array_accuracy = band_accuracy.ReadAsArray()
+
+model.checkAccuracy(array_accuracy)
+
+# Export results
+model.exportPredicted("veryhighurbansparawlNEW.tif")
+#model.exportNewUrbanCells("new_urban_cells_2030.tif")
+
+# Access the newly urbanized cells array and print count
+new_urban_array = model.newly_urbanized_cells
+print(f"\nNew urban cells count: {np.sum(new_urban_array)}")
+
+
+my_without_density = new_cell_without_densities(cbd, road, slope)
+my_without_density.extract_new_layer_values(mydistance_density, lc, model)
+
+kernel_datasets = my_without_density.get_kernel_files()
+my_without_density.export_kernel_components("kernel_component")
+
+building_vol_old = building_volume_old(cbd, road, slope, amenities, commercial, industrail, building_volume)
+building_vol_old.prepare_training_data(lc)
+building_vol_old.build_model()
+building_vol_old.train_model(epochs=50)
+
+building_vol_new = building_volume_new(cbd, road, slope, *kernel_datasets)
+building_vol_new.predict_volumes(building_vol_old, lc, model)
+
+
+# Add this comparison code:
+actual_volume_file = "/content/nedata/2025_cleaned.tif"  # Update with your actual file
+results = building_vol_new.compare_with_actual(
+    actual_volume_file,
+    output_plot="volume_comparison.png"
+)
+
+# Print metrics
+print("\nBuilding Volume Prediction Metrics:")
+print(f"RMSE: {results['rmse']:.2f} 10³m³")
+print(f"R²: {results['r2']:.2f}")
+print(f"MAE: {results['mae']:.2f} 10³m³")
+print(f"Sample Size: {results['samples']:,} cells")
+
+building_vol_new.calculate_heights(cell_size=30)
+building_vol_new.export_building_volume("newvolme.tif")
+building_vol_new.export_height_map("building_heights_suburbanization.tif")
+
+import numpy as np
+import matplotlib.pyplot as plt
+import rasterio
+
+# -------------------------------
+# 1. Define file paths
+# -------------------------------
+predicted_raster_path = '/content/sample_data/newvolme (1).tif'  # Replace with your predicted raster file path
+actual_raster_path    = '/content/sample_data/building volume_cleaned.tif'     # Replace with your actual raster file path
+
+# -------------------------------
+# 2. Read the raster data
+# -------------------------------
+# Read predicted building volumes
+with rasterio.open(predicted_raster_path) as src:
+    predicted_data = src.read(1)  # Assuming a single-band raster
+
+# Read actual building volumes
+with rasterio.open(actual_raster_path) as src:
+    actual_data = src.read(1)
+
+# -------------------------------
+# 3. Filter out non-positive values
+# -------------------------------
+# Replace values that are <= 0 with NaN so that only positive values remain
+predicted_data = np.where(predicted_data > 0, predicted_data, np.nan)
+actual_data    = np.where(actual_data > 0, actual_data, np.nan)
+
+# -------------------------------
+# 4. Flatten the arrays
+# -------------------------------
+# Convert the 2D arrays to 1D arrays for plotting
+predicted_flat = predicted_data.flatten()
+actual_flat    = actual_data.flatten()
+
+# Remove any NaN values that were introduced (so only positive values remain)
+predicted_flat = predicted_flat[~np.isnan(predicted_flat)]
+actual_flat    = actual_flat[~np.isnan(actual_flat)]
+
+# -------------------------------
+# 5. Create index arrays for plotting
+# -------------------------------
+# These will serve as the x-axis (data point index) for each series
+index_predicted = np.arange(len(predicted_flat))
+index_actual    = np.arange(len(actual_flat))
+
+# -------------------------------
+# 6. Plot the values in a single chart
+# -------------------------------
+plt.figure(figsize=(12, 8))
+
+# Plot predicted building volumes (red)
+plt.plot(index_predicted, predicted_flat, label='Predicted Building Volumes',
+         color='red', marker='o', linestyle='-', alpha=0.7)
+
+# Plot actual building volumes (blue)
+plt.plot(index_actual, actual_flat, label='Actual Building Volumes',
+         color='blue', marker='x', linestyle='-', alpha=0.7)
+
+# Add chart labels and title
+plt.xlabel('Data Point Index')
+plt.ylabel('Building Volume')
+plt.title('Building Volume Values')
+
+# Add a legend to distinguish the two series
+plt.legend()
+
+# Optional: add grid lines and adjust layout
+plt.grid(True)
+plt.tight_layout()
+
+# Display the plot
+plt.show()
