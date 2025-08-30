@@ -22,6 +22,14 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, Flatten, Dense, Input
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.utils import shuffle
+try:
+    from xgboost import XGBRegressor
+except Exception:
+    XGBRegressor = None
+from osgeo import gdal
 
 import seaborn as sns
 from sklearn.metrics import r2_score, mean_squared_error
@@ -508,8 +516,8 @@ class fitmodel:
         outdata.FlushCache()
         print(f"New urban cells exported to {outFileName}")
 
-import tensorflow as tf
-from sklearn.preprocessing import StandardScaler
+
+##Vertical urban growth modeling process - Unified model with CA
 
 class new_cell_without_densities:
     def __init__(self, *args):
@@ -525,77 +533,60 @@ class new_cell_without_densities:
         self.kernel_components = {}
 
     def _build_model(self, input_shape):
-        """Neural network architecture with 3 output units"""
         model = tf.keras.Sequential([
             tf.keras.layers.Dense(64, activation='relu', input_shape=(input_shape,)),
             tf.keras.layers.Dense(64, activation='relu'),
-            tf.keras.layers.Dense(3)  # Output layer for 3 kernel components
+            tf.keras.layers.Dense(3)
         ])
-        model.compile(optimizer='adam', loss='mse')
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss='mse')
         return model
 
     def _prepare_training_data(self, features, kernel_values):
-        """Normalize input features and prepare training data"""
         self.scaler = StandardScaler()
         X = self.scaler.fit_transform(features)
         y = kernel_values
         return X, y
 
     def _train_model(self, X, y):
-        """Train the model with prepared data"""
-        self.model = self._build_model(X.shape[1])  # Only input shape needed
+        self.model = self._build_model(X.shape[1])
         self.model.fit(X, y, epochs=10, batch_size=32, validation_split=0.2, verbose=0)
 
     def extract_new_layer_values(self, distancedd, landcover_new, ca_model):
-        """Main processing method with batch prediction"""
         self.distancedd = distancedd
         self.landcover_new = landcover_new
         self.ca_model = ca_model
 
-        # Train model if not already trained
         if self.model is None:
-            print("Training model on kernel components...")
-            X, y = self._prepare_training_data(
-                self.distancedd.features,
-                self.distancedd.kernel_values
-            )
+            X, y = self._prepare_training_data(self.distancedd.features, self.distancedd.kernel_values)
             self._train_model(X, y)
 
-        # Process new urbanized cells
         new_cells_mask = self.ca_model.newly_urbanized_cells == 1
         if np.any(new_cells_mask):
             y_coords, x_coords = np.where(new_cells_mask)
 
-            # Batch extract features
             batch_features = np.array([
                 [self.new_cell_array[n][y, x]
                  for n in range(1, self.new_cell_nFactors+1)]
                 for y, x in zip(y_coords, x_coords)
             ])
 
-            # Predict and store components
             scaled_features = self.scaler.transform(batch_features)
             batch_predictions = self.model.predict(scaled_features, verbose=0)
 
-            # Initialize component arrays
             self.kernel_components = {
                 'shopping': np.zeros_like(new_cells_mask, dtype=float),
                 'industrial': np.zeros_like(new_cells_mask, dtype=float),
                 'residential': np.zeros_like(new_cells_mask, dtype=float)
             }
 
-            # Assign predictions to individual components
             self.kernel_components['shopping'][y_coords, x_coords] = batch_predictions[:, 0]
             self.kernel_components['industrial'][y_coords, x_coords] = batch_predictions[:, 1]
             self.kernel_components['residential'][y_coords, x_coords] = batch_predictions[:, 2]
 
-
     def get_kernel_files(self):
-        """Return paths to temporary kernel files"""
         temp_files = []
-        driver = gdal.GetDriverByName("MEM")  # Use in-memory driver
+        driver = gdal.GetDriverByName("MEM")
         for name, array in self.kernel_components.items():
-            # Create in-memory dataset
             ds = driver.Create(f"temp_{name}",
                              self.landcover_new.col,
                              self.landcover_new.row,
@@ -605,14 +596,11 @@ class new_cell_without_densities:
             band = ds.GetRasterBand(1)
             band.WriteArray(array)
             band.SetNoDataValue(0)
-            temp_files.append(ds)  # Store dataset objects
+            temp_files.append(ds)
         return temp_files
 
-
     def export_kernel_components(self, base_filename):
-        """Export individual kernel components as GeoTIFFs"""
         driver = gdal.GetDriverByName("GTiff")
-
         for kernel_name, array in self.kernel_components.items():
             filename = f"{base_filename}_{kernel_name}.tif"
             out_ds = driver.Create(filename,
@@ -627,8 +615,6 @@ class new_cell_without_densities:
             out_ds.FlushCache()
             print(f"Exported {kernel_name} density to {filename}")
 
-
-
 class building_volume_old:
     def __init__(self, *args):
         self.building_v_o_arr = dict()
@@ -640,41 +626,113 @@ class building_volume_old:
             n += 1
         self.scaler = StandardScaler()
         self.model = None
+        self.ann_model = None
+        self.mlp_model = None
+        self.rf_model = None
+        self.xgb_model = None
 
     def prepare_training_data(self, landcover):
-        """Extract features and labels for training"""
         features = []
         labels = []
-
-        # Get built-up cells from landcover
         builtup_mask = landcover.arr_lc2 == 1
-
         for y in range(landcover.row):
             for x in range(landcover.col):
                 if builtup_mask[y, x]:
-                    # Extract all features except last one (building volume)
                     features.append([self.building_v_o_arr[n][y, x]
                                    for n in range(1, self.building_v_o_nFactors)])
-                    # Last array is building volume (label)
                     labels.append(self.building_v_o_arr[self.building_v_o_nFactors][y, x])
-
         self.X = self.scaler.fit_transform(np.array(features))
         self.y = np.array(labels)
 
     def build_model(self):
-        """Deep learning model for building volume prediction"""
         self.model = tf.keras.Sequential([
-            tf.keras.layers.Dense(128, activation='relu', input_shape=(self.X.shape[1],)),
+            tf.keras.layers.Dense(128, activation='relu', input_shape=(self.X.shape[1],),
+                                  kernel_regularizer=tf.keras.regularizers.l2(1e-4)),
             tf.keras.layers.Dropout(0.2),
-            tf.keras.layers.Dense(64, activation='relu'),
-            tf.keras.layers.Dense(1)  # Single output for building volume
+            tf.keras.layers.Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-4)),
+            tf.keras.layers.Dense(1)
         ])
-        self.model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+        self.model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
 
-    def train_model(self, epochs=100, batch_size=32):
-        """Train the volume prediction model"""
+    def train_model(self, epochs=200, batch_size=32):
+        es = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
         self.model.fit(self.X, self.y, epochs=epochs, batch_size=batch_size,
-                      validation_split=0.2, verbose=1)
+                      validation_split=0.2, verbose=1, callbacks=[es, reduce_lr])
+
+    def train_ann_baseline(self, epochs=100, batch_size=32):
+        X_sh, y_sh = shuffle(self.X, self.y, random_state=42)
+        inputs = self.X.shape[1]
+        ann = tf.keras.Sequential([
+            tf.keras.layers.Dense(32, activation='relu', input_shape=(inputs,)),
+            tf.keras.layers.Dense(1)
+        ])
+        ann.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss='mse', metrics=['mae'])
+        es = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        ann.fit(X_sh, y_sh, epochs=epochs, batch_size=batch_size, validation_split=0.2, verbose=0, callbacks=[es])
+        self.ann_model = ann
+
+    def train_mlp_baseline(self, epochs=150, batch_size=32, dropout_rate=0.05):
+        X_sh, y_sh = shuffle(self.X, self.y, random_state=42)
+        inputs = self.X.shape[1]
+        mlp = tf.keras.Sequential([
+            tf.keras.layers.Dense(32, activation='relu', input_shape=(inputs,),
+                                  kernel_regularizer=tf.keras.regularizers.l2(1e-5)),
+            tf.keras.layers.Dropout(dropout_rate),
+            tf.keras.layers.Dense(16, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-5)),
+            tf.keras.layers.Dense(1)
+        ])
+        mlp.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss='mse', metrics=['mae'])
+        es = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True)
+        mlp.fit(X_sh, y_sh, epochs=epochs, batch_size=batch_size, validation_split=0.2, verbose=0, callbacks=[es])
+        self.mlp_model = mlp
+
+    def train_rf_baseline(self, n_estimators=500, max_depth=None):
+        rf = RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, n_jobs=-1, random_state=42)
+        rf.fit(self.X, self.y)
+        self.rf_model = rf
+
+    def train_xgb_baseline(self, n_estimators=500, learning_rate=0.1, max_depth=6):
+        if XGBRegressor is None:
+            self.xgb_model = None
+            return
+        xgb = XGBRegressor(n_estimators=n_estimators, learning_rate=learning_rate, max_depth=max_depth,
+                           objective='reg:squarederror', n_jobs=-1, random_state=42, verbosity=0)
+        xgb.fit(self.X, self.y)
+        self.xgb_model = xgb
+
+    def train_all_models(self):
+        self.build_model()
+        self.train_model()
+        self.train_ann_baseline()
+        self.train_mlp_baseline()
+        self.train_rf_baseline()
+        self.train_xgb_baseline()
+
+    def set_active_model(self, model_name):
+        if model_name == 'dnn':
+            if self.model is None:
+                raise ValueError('DNN model is not trained yet')
+            self.model = self.model
+        elif model_name == 'ann':
+            if self.ann_model is None:
+                raise ValueError('ANN baseline not trained')
+            self.model = self.ann_model
+        elif model_name == 'mlp':
+            if self.mlp_model is None:
+                raise ValueError('MLP baseline not trained')
+            self.model = self.mlp_model
+        elif model_name == 'rf':
+            if self.rf_model is None:
+                raise ValueError('RF baseline not trained')
+            self.model = self.rf_model
+        elif model_name == 'xgb':
+            if self.xgb_model is None:
+                raise ValueError('XGB baseline not trained or xgboost unavailable')
+            self.model = self.xgb_model
+        else:
+            raise ValueError('Unknown model name')
 
 class building_volume_new:
     def __init__(self, *args):
@@ -690,61 +748,19 @@ class building_volume_new:
                 self.building_v_n_ds[n], self.building_v_n_array[n] = readraster(item)
             n += 1
         self.height_map = None
+        self.new_building_volumes = None
 
-
-    def compare_with_actual(self, actual_raster_path, output_plot="volume_comparison.png"):
-            """Compare predictions with actual building volumes and generate scatter plot"""
-            # Load actual volume data
+    def compare_with_actual(self, actual_raster_path):
             ds_actual, arr_actual = readraster(actual_raster_path)
             arr_actual = arr_actual.astype(float)
-
-            # Create mask of valid comparison cells
             valid_mask = (self.new_building_volumes > 0) & (arr_actual > 0) & ~np.isnan(arr_actual)
-
-            # Extract values for comparison
             predicted = self.new_building_volumes[valid_mask]
             actual = arr_actual[valid_mask]
-
-            # Calculate metrics
+            if len(predicted) == 0:
+                return {'rmse': None, 'r2': None, 'mae': None, 'samples': 0}
             rmse = np.sqrt(np.mean((predicted - actual)**2))
             r2 = np.corrcoef(predicted, actual)[0,1]**2
             mae = np.mean(np.abs(predicted - actual))
-
-            # Create plot
-            plt.figure(figsize=(10, 8))
-            #plt.style.use('seaborn-darkgrid')
-
-            # Scatter plot with regression line
-            sns.regplot(x=actual, y=predicted,
-                      scatter_kws={'alpha':0.4, 'color':'#2ecc71'},
-                      line_kws={'color':'#e74c3c', 'lw':2})
-
-            # Formatting
-            plt.title("Building Volume Prediction vs Actual", fontsize=16, pad=20)
-            plt.xlabel("Actual Building Volume ($10^3$ m$^3$)", fontsize=12)
-            plt.ylabel("Predicted Building Volume ($10^3$ m$^3$)", fontsize=12)
-
-            # Add metrics text
-            textstr = '\n'.join((
-                f'RMSE = {rmse:.2f} $10^3$ m$^3$',
-                f'R² = {r2:.2f}',
-                f'MAE = {mae:.2f} $10^3$ m$^3$',
-                f'N = {len(predicted):,} cells'
-            ))
-            plt.gca().text(0.05, 0.95, textstr, transform=plt.gca().transAxes,
-                          fontsize=12, verticalalignment='top',
-                          bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-
-            # Set equal axes and grid
-            max_val = max(actual.max(), predicted.max()) * 1.1
-            plt.xlim(0, max_val)
-            plt.ylim(0, max_val)
-            plt.plot([0, max_val], [0, max_val], '--', color='#3498db', alpha=0.7)
-
-            plt.tight_layout()
-            plt.savefig(output_plot, dpi=300)
-            print(f"Comparison plot saved to {output_plot}")
-
             return {
                 'rmse': rmse,
                 'r2': r2,
@@ -752,51 +768,32 @@ class building_volume_new:
                 'samples': len(predicted)
             }
 
-
-
-
-
     def predict_volumes(self, old_model, landcover, ca_model):
-        """Predict building volumes using trained model"""
         self.new_building_volumes = np.zeros_like(ca_model.newly_urbanized_cells, dtype=float)
         new_cells = np.argwhere(ca_model.newly_urbanized_cells == 1)
-
-        # Prepare features for new cells (FIXED FEATURE COUNT)
         features = []
         for y, x in new_cells:
-            # Include ALL features (1 to building_v_n_nFactors)
             features.append([self.building_v_n_array[n][y, x]
-                           for n in range(1, self.building_v_n_nFactors + 1)])  # +1 added here
-
+                           for n in range(1, self.building_v_n_nFactors + 1)])
         if len(features) > 0:
             scaled_features = old_model.scaler.transform(np.array(features))
-            predictions = old_model.model.predict(scaled_features, verbose=0)
-
-            # Assign predictions to new cells
+            preds = None
+            try:
+                preds = old_model.model.predict(scaled_features, verbose=0)
+            except Exception:
+                preds = old_model.model.predict(scaled_features)
+            if isinstance(preds, np.ndarray) and preds.ndim > 1:
+                preds = preds.reshape(-1)
             for idx, (y, x) in enumerate(new_cells):
-                self.new_building_volumes[y, x] = predictions[idx][0]
-
+                self.new_building_volumes[y, x] = preds[idx]
 
     def calculate_heights(self, cell_size=30, floor_height=3):
-        """
-        Convert volume to height using realistic assumptions:
-        - cell_size: Grid cell size in meters
-        - floor_height: Average height per floor in meters
-        """
         self.height_map = np.zeros_like(self.new_building_volumes, dtype=float)
-
-        # Calculate footprint area (assume building covers entire cell)
-        footprint_area = cell_size ** 2  # m²
-
-        # Convert volume (m³) to height (m)
+        footprint_area = cell_size ** 2
         new_cells = self.new_building_volumes > 0
         self.height_map[new_cells] = self.new_building_volumes[new_cells] / footprint_area
 
-        # Convert to floors (optional)
-        # self.height_map[new_cells] = self.height_map[new_cells] // floor_height
-
     def export_building_volume(self, filename):
-        """Export building volume map as GeoTIFF"""
         driver = gdal.GetDriverByName("GTiff")
         ds = driver.Create(filename,
                          self.height_map.shape[1],
@@ -809,10 +806,7 @@ class building_volume_new:
         band.SetNoDataValue(0)
         ds.FlushCache()
 
-
-
     def export_height_map(self, filename):
-        """Export building height map as GeoTIFF"""
         driver = gdal.GetDriverByName("GTiff")
         ds = driver.Create(filename,
                          self.height_map.shape[1],
@@ -824,6 +818,7 @@ class building_volume_new:
         band.WriteArray(self.height_map)
         band.SetNoDataValue(0)
         ds.FlushCache()
+
 
 
 # Assign the directory where files are located
