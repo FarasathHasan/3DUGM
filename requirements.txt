@@ -1,0 +1,27 @@
+# Recommended Python runtime
+# Python==3.10
+
+# Core scientific + ML
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+seaborn>=0.12
+scikit-learn>=1.2
+
+# Geospatial (binary wheels are platform-sensitive; prefer conda-forge for GDAL/rasterio)
+GDAL>=3.5
+rasterio>=1.4
+
+# Deep learning
+tensorflow>=2.11,<2.16
+
+# Optional / performance
+xgboost
+
+# Utilities
+rasterio
+psutil
+
+# If you rely on system GDAL, consider installing OS packages first (apt / conda)
+# NOTE: On Windows you may need to install GDAL wheels or use conda-forge to avoid build issues.
+# See README for installation hints.
